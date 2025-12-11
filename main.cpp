@@ -1095,6 +1095,329 @@ void BorrowFromLeftInternal(fstream &file, int nodeIndex, int leftIndex, int par
     RefreshParentMaxKeyForLeafAbdo(file, nodeIndex);
     RefreshParentMaxKeyForLeafAbdo(file, leftIndex);
 }
+
+void HandleParentUnderflow(fstream &file, int nodeIndex);
+void MergeLeaves(fstream& f, int leftIndex, int rightIndex, int parentIndex, int parentKeySlot) {
+    vector<int> left(NODE_SIZE), right(NODE_SIZE), parent(NODE_SIZE);
+    ReadNode(f, leftIndex, left);
+    ReadNode(f, rightIndex, right);
+    ReadNode(f, parentIndex, parent);
+
+    // 1) Move keys from right → left
+    int leftPos = 0;
+    while (leftPos < M && left[1 + leftPos*2] != -1) leftPos++;
+
+    for (int i = 0; i < M; i++) {
+        int key = right[1 + i*2];
+        int ptr = right[1 + i*2 + 1];
+        
+        if (key != -1 && leftPos < M) {
+            left[1 + leftPos*2] = key;
+            left[1 + leftPos*2 + 1] = ptr;
+            leftPos++;
+            
+            // Clear from right
+            right[1 + i*2] = -1;
+            right[1 + i*2 + 1] = -1;
+        }
+    }
+
+    // 2) Sort left leaf after merging
+    vector<pair<int, int>> items;
+    for (int i = 0; i < M; i++) {
+        int k = left[1 + i*2];
+        int p = left[1 + i*2 + 1];
+        if (k != -1) {
+            items.push_back({k, p});
+        }
+    }
+    
+    sort(items.begin(), items.end());
+    
+    // Clear left node
+    for (int i = 0; i < M; i++) {
+        left[1 + i*2] = -1;
+        left[1 + i*2 + 1] = -1;
+    }
+    
+    // Rewrite sorted items
+    for (int i = 0; i < items.size(); i++) {
+        left[1 + i*2] = items[i].first;
+        left[1 + i*2 + 1] = items[i].second;
+    }
+
+    // 3) Write back left node
+    WriteNode(f, leftIndex, left);
+
+    // 4) Add right node to free list
+    vector<int> header(NODE_SIZE);
+    ReadNode(f, 0, header);
+    
+    // Link right node to free list
+    right[0] = -1; // Mark as free
+    right[1] = header[1]; // Point to old first free node
+    WriteNode(f, rightIndex, right);
+    
+    // Update header to point to rightIndex as new first free
+    header[1] = rightIndex;
+    WriteNode(f, 0, header);
+
+    // 5) Remove separator key + pointer from parent
+    // Find correct child slot in parent
+    int childSlot = -1;
+    for (int i = 0; i < M; i++) {
+        if (parent[1 + i*2 + 1] == rightIndex) {
+            childSlot = i;
+            break;
+        }
+    }
+    
+    if (childSlot != -1) {
+        // Shift parent entries left to fill gap
+        for (int i = childSlot; i < M-1; i++) {
+            parent[1 + i*2] = parent[1 + (i+1)*2];
+            parent[1 + i*2 + 1] = parent[1 + (i+1)*2 + 1];
+        }
+        
+        // Clear last slot
+        parent[1 + (M-1)*2] = -1;
+        parent[1 + (M-1)*2 + 1] = -1;
+        
+        WriteNode(f, parentIndex, parent);
+    }
+
+    // 6) Update parent's max key for left child
+    RefreshParentMaxKeyForLeafAbdo(f, leftIndex);
+
+    // 7) Check for parent underflow
+    int parentKeyCount = 0;
+    for (int i = 0; i < M; i++) {
+        if (parent[1 + i*2] != -1) {
+            parentKeyCount++;
+        }
+    }
+    
+    if (parentIndex != 1 && parentKeyCount < M/2) {
+        // Handle parent underflow recursively
+        HandleParentUnderflow(f, parentIndex);
+    }
+}
+
+void MergeInternals(fstream& f, int leftIndex, int rightIndex, int parentIndex, int parentKeySlot) {
+    vector<int> left(NODE_SIZE), right(NODE_SIZE), parent(NODE_SIZE);
+    ReadNode(f, leftIndex, left);
+    ReadNode(f, rightIndex, right);
+    ReadNode(f, parentIndex, parent);
+
+    // 1) Find left free position
+    int leftPos = 0;
+    while (leftPos < M && left[1 + leftPos*2] != -1) leftPos++;
+
+    // 2) Bring separator key from parent
+    int separatorKey = parent[1 + parentKeySlot*2];
+    
+    // Find the separator key index (should be the max key for left child)
+    int maxLeftKey = -1;
+    for (int i = 0; i < M; i++) {
+        int k = left[1 + i*2];
+        if (k != -1) maxLeftKey = k;
+    }
+    
+    // Insert separator key with first child pointer from right
+    left[1 + leftPos*2] = separatorKey;
+    left[1 + leftPos*2 + 1] = right[1];
+    leftPos++;
+
+    // 3) Move keys & children from right → left
+    for (int i = 0; i < M; i++) {
+        int key = right[1 + i*2];
+        int ptr = right[1 + i*2 + 1];
+
+        if (key != -1 && leftPos < M) {
+            left[1 + leftPos*2] = key;
+            left[1 + leftPos*2 + 1] = ptr;
+            leftPos++;
+            
+            // Clear from right
+            right[1 + i*2] = -1;
+            right[1 + i*2 + 1] = -1;
+        }
+    }
+
+    // 4) Sort entries in left node
+    vector<pair<int, int>> entries;
+    for (int i = 0; i < M; i++) {
+        int k = left[1 + i*2];
+        int c = left[1 + i*2 + 1];
+        if (k != -1) {
+            entries.push_back({k, c});
+        }
+    }
+    
+    sort(entries.begin(), entries.end(), [](const pair<int,int>& a, const pair<int,int>& b) {
+        return a.first < b.first;
+    });
+    
+    // Clear left node
+    for (int i = 0; i < NODE_SIZE; i++) left[i] = -1;
+    left[0] = 1; // internal node
+    
+    // Rewrite sorted entries
+    for (int i = 0; i < entries.size() && i < M; i++) {
+        left[1 + i*2] = entries[i].first;
+        left[1 + i*2 + 1] = entries[i].second;
+    }
+
+    // 5) Write back left node
+    WriteNode(f, leftIndex, left);
+
+    // 6) Add right node to free list
+    vector<int> header(NODE_SIZE);
+    ReadNode(f, 0, header);
+    
+    // Link right node to free list
+    right[0] = -1; // Mark as free
+    right[1] = header[1]; // Point to old first free node
+    WriteNode(f, rightIndex, right);
+    
+    // Update header to point to rightIndex as new first free
+    header[1] = rightIndex;
+    WriteNode(f, 0, header);
+
+    // 7) Remove separator key + pointer from parent
+    // Find correct child slot for right node
+    int rightSlot = -1;
+    for (int i = 0; i < M; i++) {
+        if (parent[1 + i*2 + 1] == rightIndex) {
+            rightSlot = i;
+            break;
+        }
+    }
+    
+    if (rightSlot != -1) {
+        // Shift parent entries left
+        for (int i = rightSlot; i < M-1; i++) {
+            parent[1 + i*2] = parent[1 + (i+1)*2];
+            parent[1 + i*2 + 1] = parent[1 + (i+1)*2 + 1];
+        }
+        
+        // Clear last slot
+        parent[1 + (M-1)*2] = -1;
+        parent[1 + (M-1)*2 + 1] = -1;
+        
+        WriteNode(f, parentIndex, parent);
+    }
+
+    // 8) Update parent's max key for left child
+    RefreshParentMaxKeyForLeafAbdo(f, leftIndex);
+
+    // 9) Check for parent underflow
+    int parentKeyCount = 0;
+    for (int i = 0; i < M; i++) {
+        if (parent[1 + i*2] != -1) {
+            parentKeyCount++;
+        }
+    }
+    
+    if (parentIndex != 1 && parentKeyCount < M/2) {
+        HandleParentUnderflow(f, parentIndex);
+    }
+}
+
+void HandleParentUnderflow(fstream &file, int nodeIndex) {
+    // This handles underflow in internal nodes after merging
+    int parentIndex = FindParentIndex(file, nodeIndex);
+    if (parentIndex == -1) {
+        // If root is empty except for one child
+        vector<int> root(NODE_SIZE);
+        ReadNode(file, nodeIndex, root);
+        
+        // Check if we can reduce height
+        if (root[0] == 1) { // internal
+            int childCount = 0;
+            int firstChild = -1;
+            for (int i = 0; i < M; i++) {
+                if (root[1 + i*2 + 1] != -1) {
+                    childCount++;
+                    if (firstChild == -1) {
+                        firstChild = root[1 + i*2 + 1];
+                    }
+                }
+            }
+            
+            // If only one child, make it the new root
+            if (childCount == 1 && firstChild != -1) {
+                // Copy child to root position
+                vector<int> child(NODE_SIZE);
+                ReadNode(file, firstChild, child);
+                WriteNode(file, 1, child); // Write to root position
+                
+                // Add old root to free list
+                vector<int> header(NODE_SIZE);
+                ReadNode(file, 0, header);
+                root[0] = -1;
+                root[1] = header[1];
+                WriteNode(file, nodeIndex, root);
+                header[1] = nodeIndex;
+                WriteNode(file, 0, header);
+            }
+        }
+        return;
+    }
+    
+    vector<int> node(NODE_SIZE), parent(NODE_SIZE);
+    ReadNode(file, nodeIndex, node);
+    ReadNode(file, parentIndex, parent);
+    
+    // Find node's position in parent
+    int childSlot = FindChildSlotInParent(file, parentIndex, nodeIndex);
+    if (childSlot == -1) return;
+    
+    // Try to borrow from left sibling
+    int leftSiblingIndex = (childSlot > 0) ? parent[1 + (childSlot-1)*2 + 1] : -1;
+    int rightSiblingIndex = (childSlot < M-1) ? parent[1 + (childSlot+1)*2 + 1] : -1;
+    
+    bool borrowed = false;
+    
+    // Borrow from left sibling
+    if (!borrowed && leftSiblingIndex != -1) {
+        vector<int> left(NODE_SIZE);
+        ReadNode(file, leftSiblingIndex, left);
+        int leftCount = 0;
+        for (int i = 0; i < M; i++) {
+            if (left[1 + i*2] != -1) leftCount++;
+        }
+        
+        if (leftCount > M/2) {
+            BorrowFromLeftInternal(file, nodeIndex, leftSiblingIndex, parentIndex, childSlot-1);
+            borrowed = true;
+        }
+    }
+    
+    // Borrow from right sibling
+    if (!borrowed && rightSiblingIndex != -1) {
+        vector<int> right(NODE_SIZE);
+        ReadNode(file, rightSiblingIndex, right);
+        int rightCount = 0;
+        for (int i = 0; i < M; i++) {
+            if (right[1 + i*2] != -1) rightCount++;
+        }
+        
+        if (rightCount > M/2) {
+            BorrowFromRightInternal(file, nodeIndex, rightSiblingIndex, parentIndex, childSlot);
+            borrowed = true;
+        }
+    }
+    
+    // Merge if can't borrow
+    if (!borrowed) {
+        if (leftSiblingIndex != -1) {
+            MergeInternals(file, leftSiblingIndex, nodeIndex, parentIndex, childSlot-1);
+        } else if (rightSiblingIndex != -1) {
+            MergeInternals(file, nodeIndex, rightSiblingIndex, parentIndex, childSlot);
+        }
+    }
+}
 void DeleteRecordFromIndex(char* filename, int RecordID) {
 
     fstream f(filename, ios::in | ios::out | ios::binary);
@@ -1208,22 +1531,20 @@ void DeleteRecordFromIndex(char* filename, int RecordID) {
         }
     }
 
-    // Merge if borrowing failed
-    // if (!borrowed) {
-    //     if (leftSiblingIndex != -1) {
-    //         if (node[0] == 0) MergeLeaves(f, leftSiblingIndex, nodeIndex, parentIndex, childSlot-1);
-    //         else MergeInternals(f, leftSiblingIndex, nodeIndex, parentIndex, childSlot-1);
-    //     } else if (rightSiblingIndex != -1) {
-    //         if (node[0] == 0) MergeLeaves(f, nodeIndex, rightSiblingIndex, parentIndex, childSlot);
-    //         else MergeInternals(f, nodeIndex, rightSiblingIndex, parentIndex, childSlot);
-    //     } else {
-    //         cout << "Underflow: single child root?" << endl;
-    //     }
-    // }
-    if(!borrowed){
-        cout << "Merge";
-        return;
+    //Merge if borrowing failed
+    if (!borrowed) {
+        cout << "mergeing call" << endl;
+        if (leftSiblingIndex != -1) {
+            if (node[0] == 0) MergeLeaves(f, leftSiblingIndex, nodeIndex, parentIndex, childSlot-1);
+            else MergeInternals(f, leftSiblingIndex, nodeIndex, parentIndex, childSlot-1);
+        } else if (rightSiblingIndex != -1) {
+            if (node[0] == 0) MergeLeaves(f, nodeIndex, rightSiblingIndex, parentIndex, childSlot);
+            else MergeInternals(f, nodeIndex, rightSiblingIndex, parentIndex, childSlot);
+        } else {
+            cout << "Underflow: single child root?" << endl;
+        }
     }
+
 
     // Refresh parent keys
     RefreshParentMaxKeyForLeafAbdo(f, nodeIndex, oldLeafMax);
@@ -1279,8 +1600,9 @@ int main() {
     DeleteRecordFromIndex(filename, 9);
     DisplayIndexFileContent(filename);
     
+    DeleteRecordFromIndex(filename, 8);
+    DisplayIndexFileContent(filename);
     cout << SearchARecord(filename,10);
 
     return 0;
 }
-
